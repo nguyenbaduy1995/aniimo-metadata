@@ -1,0 +1,6 @@
+syntax = "proto2";
+message EncryptToken { optional int64 token=1; optional int32 compressLevel=2; optional string compressType=3; }
+message EncryptKey { optional bytes headPadding=1; optional bytes key=2; optional int64 token=3; optional bytes tailPadding=4; }
+message EncryptKeyString { optional bytes keyString=1; }
+message MsRequest { optional uint64 rid=1; optional string service=2; optional string method=3; optional bytes params=4; optional string callerId=5; optional bytes context=7; optional bytes options=8; }
+message MsResponse { optional uint64 rid=1; optional bytes params=2; optional bytes context=3; optional string service_id=4; }

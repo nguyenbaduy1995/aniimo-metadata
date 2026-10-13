@@ -1,0 +1,32 @@
+import net from 'node:net';
+import crypto from 'node:crypto';
+import zlib from 'node:zlib';
+import fs from 'node:fs';
+import {fileURLToPath} from 'node:url';
+import protobuf from 'protobufjs';
+import {encode,decode} from '@msgpack/msgpack';
+import dotenv from 'dotenv';
+const local=n=>fileURLToPath(new URL(n,import.meta.url));
+dotenv.config({path:local('.env')});
+export class RC4 {
+ constructor(key){this.s=Array.from({length:256},(_,i)=>i);this.i=0;this.j=0;let j=0;for(let i=0;i<256;i++){j=(j+this.s[i]+key[i%key.length])&255;[this.s[i],this.s[j]]=[this.s[j],this.s[i]];}}
+ apply(data){const out=Buffer.alloc(data.length);for(let k=0;k<data.length;k++){this.i=(this.i+1)&255;this.j=(this.j+this.s[this.i])&255;[this.s[this.i],this.s[this.j]]=[this.s[this.j],this.s[this.i]];out[k]=data[k]^this.s[(this.s[this.i]+this.s[this.j])&255];}return out;}
+}
+export function frame(index,payload=Buffer.alloc(0)){const h=Buffer.alloc(6);h.writeUInt32LE(payload.length+2);h.writeUInt16LE(index,4);return Buffer.concat([h,payload]);}
+// The verified game client uses legacy MessagePack raw bytes for msAuth.
+function pack(value){if(Buffer.isBuffer(value)){const h=Buffer.alloc(3);h[0]=0xda;h.writeUInt16BE(value.length,1);return Buffer.concat([h,value]);}if(Array.isArray(value)){const h=value.length<16?Buffer.from([0x90+value.length]):Buffer.from([0xdc,value.length>>8,value.length&255]);return Buffer.concat([h,...value.map(pack)]);}return Buffer.from(encode(value));}
+export class AniimoClient {
+ constructor(config={}){this.config={host:process.env.ANIIMO_HOST,port:Number(process.env.ANIIMO_PORT||10000),uid:process.env.ANIIMO_OWN_UID,auth:process.env.ANIIMO_MS_AUTH,cluster:Number(process.env.ANIIMO_CLUSTER_ID),...config};this.queue=[];this.waiters=[];this.buffer=Buffer.alloc(0);this.rid=0;}
+ fail(error){this.error=error;for(const w of this.waiters.splice(0)){clearTimeout(w.timer);w.reject(error);}}
+ ingest(data){this.buffer=Buffer.concat([this.buffer,data]);while(this.buffer.length>=4){const size=this.buffer.readUInt32LE();if(size<2||size>1048576){this.fail(Error('Invalid gateway frame'));this.close();return;}if(this.buffer.length<size+4)return;const b=this.buffer.subarray(4,size+4);this.buffer=this.buffer.subarray(size+4);const packet={index:b.readUInt16LE(),payload:b.subarray(2)};const w=this.waiters.shift();if(w){clearTimeout(w.timer);w.resolve(packet);}else this.queue.push(packet);}}
+ next(){if(this.queue.length)return Promise.resolve(this.queue.shift());if(this.error)return Promise.reject(this.error);return new Promise((resolve,reject)=>{const w={resolve,reject};w.timer=setTimeout(()=>{this.waiters=this.waiters.filter(x=>x!==w);reject(Error('Gateway response timeout'));},10000);this.waiters.push(w);});}
+ async connect(){const c=this.config;if(!/^\d+$/.test(c.uid||'')||!/^([a-f\d]{2})+$/i.test(c.auth||'')||!Number.isInteger(c.cluster))throw Error('Set ANIIMO_OWN_UID, ANIIMO_MS_AUTH and ANIIMO_CLUSTER_ID in .env');this.root=await protobuf.load(local('wire.proto'));this.socket=net.createConnection({host:c.host,port:c.port});this.socket.on('error',e=>this.fail(e));this.socket.on('close',()=>this.fail(Error('Gateway connection closed')));this.socket.on('data',data=>{if(this.rx)this.inflate.write(this.rx.apply(data));else this.ingest(data);});await new Promise((resolve,reject)=>{this.socket.once('connect',resolve);this.socket.once('error',reject);});this.socket.write(frame(1));let token;while(!token){const p=await this.next();if(p.index===10)token=this.root.lookupType('EncryptToken').decode(p.payload);}
+ const key=crypto.createHash('sha1').update(crypto.randomBytes(16)).digest();const plain=this.pb('EncryptKey',{headPadding:crypto.randomBytes(10),key,token:token.token,tailPadding:crypto.randomBytes(20)});const encrypted=crypto.publicEncrypt({key:fs.readFileSync(local('public-key.pem')),padding:crypto.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:'sha1'},plain);
+ this.rx=new RC4(key);this.tx=new RC4(key);this.inflate=zlib.createInflate();this.deflate=zlib.createDeflate();this.inflate.on('data',d=>this.ingest(d));this.inflate.on('error',e=>this.fail(e));this.deflate.on('error',e=>this.fail(e));this.deflate.on('data',d=>this.socket.write(this.tx.apply(d)));this.socket.write(frame(2,this.pb('EncryptKeyString',{keyString:encrypted})));while((await this.next()).index!==11){}await this.call('PhonestGate','bind',[c.uid,Buffer.from(c.auth,'hex'),c.cluster],{});return this;
+ }
+ pb(type,obj){const t=this.root.lookupType(type);return Buffer.from(t.encode(t.create(obj)).finish());}
+ async call(service,method,args,options={callerId:this.config.uid}){const rid=++this.rid;this.deflate.write(frame(33,this.pb('MsRequest',{rid,service,method,params:pack(args),callerId:'',context:pack({}),options:pack(options)})));await new Promise((resolve,reject)=>this.deflate.flush(zlib.constants.Z_SYNC_FLUSH,e=>e?reject(e):resolve()));while(true){const p=await this.next();if(p.index!==34&&p.index!==23)continue;const msg=this.root.lookupType('MsResponse').decode(p.payload);if(Number(msg.rid)!==rid)continue;const result=decode(msg.params,{useBigInt64:true});if(!result.Ret?.[0])throw Error(`${service}.${method}: ${result.Ret?.[1]||'request rejected'}`);return result;}}
+ async getUserInfo(uid,fields=JSON.parse(fs.readFileSync(local('profile-fields.json'),'utf8'))){if(!/^\d+$/.test(String(uid)))throw Error('UID must contain digits');const r=await this.call('UserDataService','getAttribute',[String(uid),fields]);const profile=r.AttributesMap||{};if(profile.stableAttributesStr){profile.stableAttributesDict=decode(Buffer.from(profile.stableAttributesStr,'base64'),{useBigInt64:true});const m=profile.stableAttributesDict.countryPetFormCountMap||{};const total=mask=>Object.values(m).reduce((sum,v)=>sum+Number(v[mask]||0),0);profile.collectionFormCounts={caught:total(2),sparkling:total(8),prismana:total(512)};}return {targetUid:String(uid),profile};}
+ async searchUsers(partial,limit=20,fields=['playerName','level','online']){if(!partial?.trim())throw Error('Name cannot be empty');if(!Number.isInteger(limit)||limit<1||limit>20)throw Error('Limit must be 1–20');return (await this.call('UserDataService','getFuzzyNameAttribute',[partial,fields,limit])).Results||[];}
+ close(){this.socket?.destroy();this.inflate?.destroy();this.deflate?.destroy();}
+}
